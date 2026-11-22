@@ -1,0 +1,19 @@
+- insert:
+    - id: toolbox
+      name: 'dsh-toolbox-gjkt'
+      config:
+        notifyOn: true
+        toolbarOn: true
+        autoWakeOn: false
+        mode: background
+        subagent: false
+        search: true
+        translate: true
+        copy: true
+        ask: true
+        searchEngine: bing
+        translateDir: auto
+        sysinfoOn: true
+        encodingOn: true
+        tokenCostOn: true
+        conflictsOn: true
