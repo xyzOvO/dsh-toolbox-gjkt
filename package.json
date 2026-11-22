@@ -1,6 +1,6 @@
 {
   "name": "dsh-toolbox-gjkt",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "description": "DSH plugin: task notifications, selection toolbar, auto-continue and four agent tools, all configured in one 工具箱 settings section.",
   "exports": {
