@@ -30,9 +30,11 @@ DSH 后台任务完成 / 出错时，弹 **系统级通知**（窗口最小化�
 - 数据来自 DSH 核心转发的会话事件 `api-session/status` / `error` / `added` / `removed`，**不轮询、不写 host RPC**。
 - 通知走浏览器 Notification API（与 dsh-cost-meter 同一通道）；提示音用 Web Audio 现场合成。
 - **通知模式**：仅后台（默认，窗口失焦/隐藏才通知）/ 始终 / 从不。
+- **通知提示音**：经典双音（默认）/ 单音 / 三连音 / 关闭（静音）。浏览器 Notification API 本身不支持指定声音，提示音由页面用 Web Audio 现场合成，所以可在这里换音色或静音。
 - **子代理完成也通知**：默认关（子代理作为独立 session 走 `api-session/*`，用 `origin/parentId` 识别）。
 - **产物与工作流增强**：任务完成时，通过 `ctx.sessions.retain()` 读该会话的 durable 事件流，把本轮 `present` 产物文件名、`tool-workflow/run-end` 结果一并写进通知正文。
 - 「测试通知」按钮在设置页里，点了应当立即弹出一条系统通知。
+- 「测试自动续作」按钮往当前会话发那条自动续作气泡，让 agent 立刻自己接着跑——用来绕过"产物+回合结束+失焦必须同一刻"的时序死结，验证续作链路。
 
 ### 已知边界
 
@@ -93,13 +95,25 @@ DSH 后台任务完成 / 出错时，弹 **系统级通知**（窗口最小化�
 - `config_conflicts` 的「冲突」是机械规则（重复文本 / 同名）；DSH 原生没有语义冲突检测，规则由本工具定义。
 - `sysinfo` 的网络收发流量 `node:os` 拿不到（需额外装 `systeminformation`，未装）。
 
+## 📡 远程连接巡检（Remote health）
+
+读取 `ds-harness-remote` 的连接状态 + 一键重连 + 连接日志 + 保活看门狗。走 DSH WebServer 的同源控制路由 `/ds-harness-remote`（浏览器自动带 HttpOnly cookie，无 token / 无 CORS / 无 host.call），所以纯客户端实现、刷新即生效。展开卡片时才拉一次状态。
+
+- **状态字段**（都来自 host `hostStatus()`，真实存在）：在线/重连中、已配置/已授权、设备名、账号、最后活跃、恢复截止、最近错误、需重新授权、已连接客户端列表（名称 · 平台 · 模式）。**手机 App「网络详情」里的 TURN / RTT / ICE IP / 回落原因属于手机侧连接诊断，主机端拿不到，卡片不会显示。**
+- **连接日志**：只读按钮，拉 `settings.logs.get`（filter=warn），显示最近 8 条 warning 行（`settings.logs.get` 只接受 `all`|`warn`，limit 1–1000）。
+- **保活看门狗**：默认开（localStorage `dsh-toolbox.remoteWatchdog` 持久化，不进 Config、不触发重装）。每 20s 检查一次状态；仅当**明确离线**（`online===false`）且**未在重连**（`reconnecting!==true`）、**不需重新授权**（`accountRequired!==true`）时，才请求一次 `host.reconnect`，60s 冷却、可随时暂停。只补一层应用层保险，不改插件底层的心跳/重连参数（那些要重输账号密码重新授权，风险大）。
+- `ds-harness-remote@0.6.6` **自带**连接级自恢复：`reconnect` 默认开（full-jitter 0–30s）、控制连接心跳超时重连、LAN→P2P→TURN→Relay 回退。看门狗不重复造这套，只在它没兜住时补一次重连。
+- **修不了**（只提示人工处理）：token 过期 / 授权撤销 / 设备吊销（需重新配对）、凭据锁残留目录 `SERVER_CREDENTIALS_BUSY`、DSH 进程崩溃、网络/TURN 本身不通。
+- DSH core 没有 Remote 连接状态事件（`remoteAccess` 是权限注册表、`connection` 是认证路由），所以状态只能从插件自己的控制面拿。
+- **进程守护**（插件内做不到，需外部）：见 [REMOTE-GUARD.md](REMOTE-GUARD.md)——核对过的 Windows 任务计划程序配方；不要用 NSSM 包 Electron Desktop exe（Session 0 隔离，GUI 不可见）。
+
 ## 设置存储
 
 所有开关走 DSH 原生 Config（host `index.js` 的 `export const Config`，字段全部 `.volatile()`，改完即时生效、无需重启插件）。设置页通过 `settings.section` 挂载，读写走 `ctx.configForms`。host 工具的 master 开关在**执行时**判断，所以关掉后立即生效，不必重装。没有用 localStorage，也没有把控件塞进主对话框。
 
 ## 回滚
 
-设置 → 插件 → 找到 `@local/dsh-toolbox` → 关闭/卸载；或直接删除 `D:\AI库\dsh-toolbox` 目录后卸载。
+设置 → 插件 → 找到 `dsh-toolbox-gjkt` → 关闭/卸载；或直接删除 `D:\AI库\dsh-toolbox` 目录后卸载。
 
 ## 版本
 

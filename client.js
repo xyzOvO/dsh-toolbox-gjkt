@@ -22,6 +22,9 @@ window.__ModuleLoader__.load({
     // notification helpers
     // =====================================================================
     let audioCtx = null
+    // Factory-level getter, wired in apply() to read the live volatile config so
+    // chime changes apply immediately without a reload.
+    let currentChime = () => 'dual'
     function unlockAudio() {
       if (audioCtx) return
       const AC = window.AudioContext || window.webkitAudioContext
@@ -29,22 +32,27 @@ window.__ModuleLoader__.load({
       try { audioCtx = new AC() } catch (_) { audioCtx = null }
     }
     function playChime() {
-      if (!audioCtx) return
+      const mode = currentChime()
+      if (mode === 'off' || !audioCtx) return
       try {
         if (audioCtx.state === 'suspended') audioCtx.resume()
         const now = audioCtx.currentTime
-        ;[880, 1174.66].forEach((freq, i) => {
+        // each preset: [frequency, start offset (s), duration (s)]
+        const notes = mode === 'single' ? [[880, 0, 0.3]]
+          : mode === 'triple' ? [[784, 0, 0.22], [988, 0.16, 0.22], [1318.5, 0.32, 0.32]]
+          : [[880, 0, 0.3], [1174.66, 0.16, 0.3]] // dual (default)
+        notes.forEach(([freq, offset, dur]) => {
           const osc = audioCtx.createOscillator()
           const gain = audioCtx.createGain()
           osc.type = 'sine'
           osc.frequency.value = freq
-          const t = now + i * 0.16
+          const t = now + offset
           gain.gain.setValueAtTime(0.0001, t)
           gain.gain.exponentialRampToValueAtTime(0.18, t + 0.02)
-          gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.28)
+          gain.gain.exponentialRampToValueAtTime(0.0001, t + dur)
           osc.connect(gain).connect(audioCtx.destination)
           osc.start(t)
-          osc.stop(t + 0.3)
+          osc.stop(t + dur + 0.02)
         })
       } catch (_) { /* best effort */ }
     }
@@ -97,6 +105,41 @@ window.__ModuleLoader__.load({
       if (!isBackgrounded()) return 'foreground'
       return fireNotification(title, body)
     }
+
+    // =====================================================================
+    // remote (ds-harness-remote) status helpers
+    // Same-origin control route on the DSH WebServer, so the browser sends its
+    // HttpOnly auth cookie automatically — no token in JS, no CORS, no host.call.
+    // We use bare fetch/EventSource so this stays a client.js-only change.
+    // =====================================================================
+    const REMOTE_BASE = '/ds-harness-remote'
+    function remoteCall(method, payload) {
+      return new Promise((resolve, reject) => {
+        try {
+          const rpcId = 'tb-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+          fetch(REMOTE_BASE + '/' + method, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ type: 'client-request', rpcId, method, payload: payload || {} }),
+          })
+            .then((r) => r.json())
+            .then((full) => {
+              const result = full && full.result
+              if (result && result.ok) resolve(result.value)
+              else reject(new Error((result && result.error && result.error.message) || 'rpc-failed'))
+            })
+            .catch(reject)
+        } catch (e) { reject(e) }
+      })
+    }
+    const remoteStatus = () => remoteCall('status')
+    const remoteReconnect = () => remoteCall('host.reconnect')
+    const remoteLogs = () => remoteCall('settings.logs.get', { filter: 'warn', limit: 30 })
+    // Watchdog on/off is kept in localStorage so toggling it needs no Config
+    // change (which would force a bundle reinstall). Default = on.
+    const WD_KEY = 'dsh-toolbox.remoteWatchdog'
+    const wdEnabled = () => { try { return localStorage.getItem(WD_KEY) !== 'off' } catch (_) { return true } }
+    const setWdEnabled = (v) => { try { localStorage.setItem(WD_KEY, v ? 'on' : 'off') } catch (_) {} }
 
     // =====================================================================
     // selection toolbar helpers
@@ -177,6 +220,7 @@ window.__ModuleLoader__.load({
     const ENTRY_ID = 'toolbox'                       // configForms namespace = cordis.patch row id
     const LOCALE = 'toolbox.settings'
     const MODE_KEYS = ['background', 'always', 'never']
+    const CHIME_KEYS = ['dual', 'single', 'triple', 'off']
 
     const en = {
       nav: 'Toolbox',
@@ -191,8 +235,11 @@ window.__ModuleLoader__.load({
       notifyDesc: 'System notification and chime when a background task finishes.',
       mode: 'When to notify',
       background: 'Background only', always: 'Always', never: 'Never',
+      chime: 'Notification sound', chime_dual: 'Classic (two notes)',
+      chime_single: 'Single chime', chime_triple: 'Three notes', chime_off: 'Off (silent)',
       subagent: 'Also notify when a subagent finishes',
       autoWake: 'Auto-continue after completion',
+      testWake: 'Test auto-continue', wakeSent: 'Sent — watch this session continue on its own',
       autoWakeDesc: 'When a task produces an artifact or ends a workflow, append a message to continue it. Appears as a user bubble; needs this window open.',
       test: 'Send test notification', sent: 'Sent', failed: 'Not sent',
       toolbarTitle: 'Selection toolbar',
@@ -228,6 +275,24 @@ window.__ModuleLoader__.load({
       desc_encoding_run: 'Run a command and decode garbled Chinese back to readable text.',
       desc_token_cost: 'See how many tokens instructions, skills and tool schemas eat.',
       desc_config_conflicts: 'Find duplicated instructions, same-named skills or tools.',
+      // remote health card
+      remoteTitle: 'Remote health',
+      remoteDesc: 'Status of ds-harness-remote. Read-only plus a reconnect button; the plugin already auto-reconnects on its own.',
+      remoteRefresh: 'Refresh', remoteReconnect: 'Reconnect now',
+      remoteChecking: 'Checking…', remoteOnline: 'Online', remoteReconnecting: 'Reconnecting',
+      remoteOffline: 'Offline', remoteUnknown: 'Unavailable',
+      remoteClients: 'connected clients', remoteLastActive: 'last active',
+      remoteChecked: 'checked', remoteNeedAuth: 'Authorization expired — please re-pair in the Remote panel.',
+      remoteReconnectSent: 'Reconnect requested', remoteReconnectFail: 'Reconnect failed',
+      remoteNoPlugin: 'ds-harness-remote is not running or its control route is unavailable.',
+      remoteDiag: 'configured {c} · authorized {a}', remoteHostErr: 'last error',
+      remoteDevice: 'device', remoteAccount: 'account', remoteRecovery: 'recovery until',
+      remoteClientItem: '{n} · {p} · {m}', remoteNoClients: 'no connected clients',
+      remoteLogs: 'connection logs', remoteLogLoading: 'loading…', remoteLogEmpty: 'no warnings logged',
+      remoteWatchdog: 'keep-connected watchdog', remoteWatchdogOn: 'on — auto-reconnect if dropped',
+      remoteWatchdogOff: 'off — paused', remoteWatchdogHelp: 'Checks status every 20s; if offline and not already reconnecting, requests one reconnect (60s cooldown). The plugin itself already auto-reconnects; this is a safety net.',
+      remoteAutoReconnected: 'auto-reconnect requested',
+      remoteLimit: 'Cannot fix by plugin: expired token, revoked device, leftover credential lock, or a crashed DSH process.',
     }
     const zh = {
       nav: '工具箱',
@@ -242,8 +307,11 @@ window.__ModuleLoader__.load({
       notifyDesc: '后台任务完成时弹出系统通知并播放提示音。',
       mode: '通知模式',
       background: '仅后台', always: '始终', never: '从不',
+      chime: '通知提示音', chime_dual: '经典双音',
+      chime_single: '单音', chime_triple: '三连音', chime_off: '关闭（静音）',
       subagent: '子代理完成也通知',
       autoWake: '完成后自动续作',
+      testWake: '测试自动续作', wakeSent: '已发送——看本会话自己接着跑',
       autoWakeDesc: '任务产出文件或工作流结束时，自动追加一条消息让它继续。会显示一条用户气泡，且需要本窗口保持打开。',
       test: '测试通知', sent: '已发送', failed: '未发送',
       toolbarTitle: '划词工具栏',
@@ -279,10 +347,29 @@ window.__ModuleLoader__.load({
       desc_encoding_run: '跑一条命令，把乱码中文变回能看的字。',
       desc_token_cost: '看指令、Skill、工具说明各吃了多少 token。',
       desc_config_conflicts: '查出重复的指令、重名的 Skill 和工具。',
+      // remote health card
+      remoteTitle: '远程连接巡检',
+      remoteDesc: '读取 ds-harness-remote 的连接状态。只读 + 一键重连；插件本身已带自动重连，不用重复造。',
+      remoteRefresh: '刷新状态', remoteReconnect: '立即重连',
+      remoteChecking: '检查中…', remoteOnline: '在线', remoteReconnecting: '重连中',
+      remoteOffline: '离线', remoteUnknown: '不可用',
+      remoteClients: '已连接客户端', remoteLastActive: '最后活跃',
+      remoteChecked: '检查于', remoteNeedAuth: '授权已过期——请到 Remote 面板重新配对。',
+      remoteReconnectSent: '已请求重连', remoteReconnectFail: '重连请求失败',
+      remoteNoPlugin: 'ds-harness-remote 未运行，或其控制路由不可用。',
+      remoteDiag: '已配置 {c} · 已授权 {a}', remoteHostErr: '最近错误',
+      remoteDevice: '设备', remoteAccount: '账号', remoteRecovery: '恢复到',
+      remoteClientItem: '{n} · {p} · {m}', remoteNoClients: '暂无已连接客户端',
+      remoteLogs: '连接日志', remoteLogLoading: '读取中…', remoteLogEmpty: '没有警告日志',
+      remoteWatchdog: '保活看门狗', remoteWatchdogOn: '开 — 掉线时自动重连',
+      remoteWatchdogOff: '关 — 已暂停', remoteWatchdogHelp: '每 20 秒检查状态；若离线且未在重连，请求一次重连（60 秒冷却）。插件本身已带自动重连，这是一层保险。',
+      remoteAutoReconnected: '已自动请求重连',
+      remoteLimit: '插件修不了的：token 过期、设备被吊销、凭据锁残留、DSH 进程崩溃——这些只能手动处理。',
     }
 
     // factory-level translator for runtime notifications / toolbar (no React hook here)
     let tr = (k) => String(k)
+    let wdLastReconnect = 0 // remote watchdog cooldown timestamp
     const tv = (k, vars) => {
       let s = tr(k)
       if (vars) for (const name of Object.keys(vars)) s = s.split('{' + name + '}').join(vars[name])
@@ -320,6 +407,13 @@ window.__ModuleLoader__.load({
         setHint(r === 'sent' ? t('sent') : t('failed') + ' (' + r + ')')
         setTimeout(() => setHint(''), r === 'sent' ? 2000 : 6000)
       }
+      const onTestWake = () => {
+        // Reuse the session.prompt path: send the exact auto-continue bubble to
+        // the current main session so the agent picks it up and runs on its own.
+        const r = runTool('autoWakeMsg')
+        setHint(r === 'ok' ? t('wakeSent') : t('failed') + ' (' + r + ')')
+        setTimeout(() => setHint(''), r === 'ok' ? 2500 : 6000)
+      }
       const onRun = (toolKey) => {
         if (typeof runTool !== 'function') { setHint(t('noRemote')); setTimeout(() => setHint(''), 5000); return }
         const r = runTool(toolKey)
@@ -333,7 +427,76 @@ window.__ModuleLoader__.load({
         { key: 'tokenCostOn', msg: 'run_token_cost', desc: 'desc_token_cost' },
         { key: 'conflictsOn', msg: 'run_config_conflicts', desc: 'desc_config_conflicts' },
       ]
-      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true })
+      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true })
+      // remote health state — read only when the card is opened
+      const [remote, setRemote] = useState({ loading: false, data: null, error: null, at: null })
+      const [remoteHint, setRemoteHint] = useState('')
+      const [remoteLogsState, setRemoteLogsState] = useState({ loading: false, entries: null })
+      const [watchOn, setWatchOn] = useState(wdEnabled())
+      const toggleWatchdog = (v) => { setWdEnabled(v); setWatchOn(v) }
+      const loadLogs = async () => {
+        setRemoteLogsState((s) => Object.assign({}, s, { loading: true }))
+        try {
+          const raw = await remoteLogs()
+          const entries = (raw && Array.isArray(raw.entries)) ? raw.entries : []
+          setRemoteLogsState({ loading: false, entries })
+        } catch (e) {
+          setRemoteLogsState({ loading: false, entries: [] })
+        }
+      }
+      const checkRemote = async () => {
+        setRemote((r) => Object.assign({}, r, { loading: true, error: null }))
+        try {
+          const raw = await remoteStatus()
+          // Host mode returns { mode:'local', available:false, host:{online,...} };
+          // the real state lives under .host. Flatten it so the card reads it right.
+          const data = raw && raw.host
+            ? Object.assign({}, raw.host, { update: raw.update, deviceName: raw.deviceName })
+            : (raw || {})
+          setRemote({ loading: false, data, error: null, at: new Date() })
+        } catch (e) {
+          setRemote({ loading: false, data: null, error: String(e && e.message ? e.message : e), at: new Date() })
+        }
+      }
+      const doReconnect = async () => {
+        setRemoteHint(t('remoteChecking'))
+        try {
+          await remoteReconnect()
+          setRemoteHint(t('remoteReconnectSent'))
+          setTimeout(() => { checkRemote(); setRemoteHint('') }, 1200)
+        } catch (e) {
+          setRemoteHint(t('remoteReconnectFail'))
+          setTimeout(() => setRemoteHint(''), 4000)
+        }
+      }
+      // one-shot load the first time this card is expanded
+      useEffect(() => {
+        if (!collapsed.remote && remote.data === null && !remote.loading && remote.at === null) checkRemote()
+      }, [collapsed.remote])
+      // Keep-connected watchdog: poll status, request ONE reconnect when clearly
+      // offline with a 60s cooldown. Skips when paused, mid-reconnect, or auth needed.
+      useEffect(() => {
+        if (!watchOn) return
+        let cancelled = false
+        const tick = async () => {
+          if (cancelled) return
+          try {
+            const raw = await remoteStatus()
+            if (cancelled) return
+            const data = raw && raw.host ? raw.host : (raw || {})
+            const offline = data.online === false
+            const busy = data.reconnecting === true || data.accountRequired === true
+            const cooled = Date.now() - wdLastReconnect > 60_000
+            if (offline && !busy && cooled) {
+              wdLastReconnect = Date.now()
+              await remoteReconnect()
+              if (!cancelled) setRemoteHint(t('remoteAutoReconnected'))
+            }
+          } catch (_) { /* route unavailable — do nothing */ }
+        }
+        const id = setInterval(tick, 20_000)
+        return () => { cancelled = true; clearInterval(id) }
+      }, [watchOn])
       // Styled sliding switch (button with role=switch) instead of a native checkbox.
       const Switch = ({ checked, disabled, onChange, label }) => h('button', {
         type: 'button', role: 'switch', 'aria-checked': !!checked, 'aria-label': label,
@@ -421,6 +584,11 @@ window.__ModuleLoader__.load({
             value: mode, disabled: !writable || !on('notifyOn', true),
             onChange: (e) => setMode(e.target.value), style: controlStyle,
           }, MODE_KEYS.map((k) => h('option', { key: k, value: k }, t(k)))), true),
+          cardRow(t('chime'), h('select', {
+            value: CHIME_KEYS.indexOf(value.chime) >= 0 ? value.chime : 'dual',
+            disabled: !writable || !on('notifyOn', true),
+            onChange: (e) => setValue('chime', e.target.value), style: controlStyle,
+          }, CHIME_KEYS.map((k) => h('option', { key: k, value: k }, t('chime_' + k))))),
           cardRow(t('subagent'), h(Switch, {
             checked: subagent, disabled: !writable || !on('notifyOn', true),
             onChange: (v) => setSubagent(v), label: t('subagent'),
@@ -432,9 +600,10 @@ window.__ModuleLoader__.load({
               onChange: (v) => setValue('autoWakeOn', v), label: t('autoWake'),
             })
           ),
-          h('div', { style: { display: 'flex', alignItems: 'center', paddingTop: 10 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', paddingTop: 10, gap: 10 } },
             h('button', { type: 'button', onClick: onTest, disabled: !on('notifyOn', true), style: primaryBtn }, t('test')),
-            hint ? h('span', { style: { fontSize: 12, marginLeft: 10, opacity: .7 } }, hint) : null
+            h('button', { type: 'button', onClick: onTestWake, style: primaryBtn }, t('testWake')),
+            hint ? h('span', { style: { fontSize: 12, opacity: .7 } }, hint) : null
           )
         )),
         // ---- card 2: selection toolbar ----
@@ -471,6 +640,76 @@ window.__ModuleLoader__.load({
             }, t('run')),
             i === 0
           ))
+        )),
+        // ---- card 4: remote health (ds-harness-remote, same-origin control route) ----
+        cardSection('remote', '📡', t('remoteTitle'), h('div', null,
+          groupDesc(t('remoteDesc')),
+          (() => {
+            let label, color
+            if (remote.loading) { label = t('remoteChecking'); color = '#888' }
+            else if (remote.error || !remote.data) { label = t('remoteUnknown'); color = '#888' }
+            else if (remote.data.online) { label = t('remoteOnline'); color = '#2e8b57' }
+            else if (remote.data.reconnecting) { label = t('remoteReconnecting'); color = '#d68910' }
+            else { label = t('remoteOffline'); color = '#888' }
+            return cardRow(t('remoteChecked') + (remote.at ? ' ' + remote.at.toLocaleTimeString() : ''),
+              h('span', { style: { fontWeight: 600, color } }, label), true)
+          })(),
+          remote.data && typeof remote.data.configured === 'boolean'
+            ? h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', padding: '4px 0' } },
+                tv('remoteDiag', { c: remote.data.configured ? '✓' : '✗', a: remote.data.authorized ? '✓' : '✗' }))
+            : null,
+          remote.data && remote.data.deviceName
+            ? cardRow(t('remoteDevice'), h('span', null, String(remote.data.deviceName)))
+            : null,
+          remote.data && remote.data.account && (remote.data.account.email || remote.data.account.name)
+            ? cardRow(t('remoteAccount'), h('span', null, String(remote.data.account.email || remote.data.account.name)))
+            : null,
+          remote.data && remote.data.lastActiveAt
+            ? cardRow(t('remoteLastActive'), h('span', null, new Date(remote.data.lastActiveAt).toLocaleString()))
+            : null,
+          remote.data && remote.data.recoveryExpiresAt
+            ? cardRow(t('remoteRecovery'), h('span', null, new Date(remote.data.recoveryExpiresAt).toLocaleString()))
+            : null,
+          remote.data && remote.data.error
+            ? h('div', { style: { fontSize: 11, color: '#c0392b', padding: '4px 0' } }, t('remoteHostErr') + ': ' + String(remote.data.error))
+            : null,
+          remote.data && remote.data.accountRequired
+            ? h('div', { style: { fontSize: 12, color: '#c0392b', padding: '4px 0' } }, t('remoteNeedAuth'))
+            : null,
+          remote.data && remote.data.connectedClients
+            ? (remote.data.connectedClients.length
+                ? h('div', { style: { padding: '4px 0' } },
+                    h('div', { style: { fontSize: 12, fontWeight: 600, paddingBottom: 2 } }, t('remoteClients') + ': ' + remote.data.connectedClients.length),
+                    ...remote.data.connectedClients.map((c, i) => h('div', { key: i, style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', padding: '1px 0' } },
+                      tv('remoteClientItem', { n: c.name || c.deviceId || '?', p: c.platform || '-', m: c.mode || '-' }))))
+                : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', padding: '4px 0' } }, t('remoteNoClients')))
+            : null,
+          remote.error
+            ? h('div', { style: { fontSize: 11, color: '#c0392b', padding: '4px 0' } }, t('remoteNoPlugin'))
+            : null,
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, paddingTop: 10, flexWrap: 'wrap' } },
+            h('button', { type: 'button', onClick: checkRemote, disabled: remote.loading, style: controlStyle }, t('remoteRefresh')),
+            h('button', { type: 'button', onClick: doReconnect, style: primaryBtn }, t('remoteReconnect')),
+            h('button', { type: 'button', onClick: loadLogs, disabled: remoteLogsState.loading, style: controlStyle }, t('remoteLogs')),
+            remoteHint ? h('span', { style: { fontSize: 12, opacity: .7 } }, remoteHint) : null
+          ),
+          remoteLogsState.loading
+            ? h('div', { style: { fontSize: 11, color: '#888', paddingTop: 6 } }, t('remoteLogLoading'))
+            : (remoteLogsState.entries !== null
+                ? h('div', { style: { paddingTop: 6 } },
+                    remoteLogsState.entries.length === 0
+                      ? h('div', { style: { fontSize: 11, color: '#888' } }, t('remoteLogEmpty'))
+                      : remoteLogsState.entries.slice(-8).map((e, i) => h('div', {
+                          key: i,
+                          style: { fontSize: 10, fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #888)', padding: '1px 0', wordBreak: 'break-all' },
+                        }, e.line || (e.timestamp + ' ' + e.level + ' ' + e.message))))
+                : null),
+          cardRow(t('remoteWatchdog'), h('span', null,
+            h(Switch, { checked: watchOn, onChange: toggleWatchdog, label: t('remoteWatchdog') }),
+            h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', marginLeft: 8 } },
+              watchOn ? t('remoteWatchdogOn') : t('remoteWatchdogOff')))),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', padding: '2px 0', lineHeight: '16px' } }, t('remoteWatchdogHelp')),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 8, lineHeight: '16px' } }, t('remoteLimit'))
         )),
       )
     }
@@ -568,6 +807,7 @@ window.__ModuleLoader__.load({
         const t = ctx.locale.bind(LOCALE)
         tr = t // bind the factory-level translator used by notifications / toolbar
         const cfg = () => (form.getSnapshot() && form.getSnapshot().value) || {}
+        currentChime = () => (CHIME_KEYS.indexOf(cfg().chime) >= 0 ? cfg().chime : 'dual')
         const isOn = (key, dflt) => (typeof cfg()[key] === 'boolean' ? cfg()[key] : dflt)
 
         // settings section contribution
@@ -780,11 +1020,37 @@ window.__ModuleLoader__.load({
             running.delete(sessionId)
             release(sessionId)
           })
+
+          // Startup seed + resync: on a page refresh the in-memory `running` map
+          // is empty, and a session that was already running emits no fresh
+          // status:true after we subscribe. Without this, its eventual status:false
+          // sees prev=false and never notifies. Seed from the live session list,
+          // and keep resyncing on list changes in case the snapshot wasn't populated
+          // yet at effect time. acquire()/running.has dedupe so this stays cheap.
+          let offList = null
+          try {
+            const sessionsSvc = ctx.get('sessions')
+            const list = sessionsSvc && sessionsSvc.list
+            const seed = () => {
+              const byId = list && list.getSnapshot().byId
+              if (!byId) return
+              for (const id of Object.keys(byId)) {
+                const row = byId[id]
+                if (!row) continue
+                markSubagent(row)
+                if (row.running === true && !running.has(id)) { running.set(id, true); acquire(id) }
+              }
+            }
+            seed()
+            if (list && typeof list.subscribe === 'function') offList = list.subscribe(seed)
+          } catch (e) { console.warn('[dsh-toolbox-gjkt] startup seed failed', e) }
+
           return () => {
             try { offAdded && offAdded() } catch (_) {}
             try { offStatus && offStatus() } catch (_) {}
             try { offError && offError() } catch (_) {}
             try { offRemoved && offRemoved() } catch (_) {}
+            try { offList && offList() } catch (_) {}
             for (const id of [...sessionsBus.keys()]) release(id)
           }
         }, 'dsh-toolbox-gjkt.events')
