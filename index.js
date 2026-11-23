@@ -9,9 +9,27 @@
  * Host agent tools (sysinfo / encoding_run / token_cost / config_conflicts)
  * are registered from ./tools.js. schemastery is a declared dependency so the
  * package installs and resolves normally on any machine.
+ *
+ * The citation rule is injected as a system-prompt section so it is present on
+ * every model step without relying on the model to go read a rules file.
  */
 import z from '@deepseek-ai/schemastery'
 import { registerAllTools } from './tools.js'
+
+// Citation instruction injected into the system prompt. Text is a function of
+// live volatile config, so toggling the switch or format applies immediately.
+const CITE_SHARED = [
+  'When a factual claim comes from a source you actually retrieved, append one clickable citation immediately after the claim.',
+  'Web source: write the full URL. Local note: write the absolute path with forward slashes (e.g. D:/path/to/note.md) and only after confirming the file exists via a search — never invent a path from memory.',
+  'Do not cite generic knowledge, reasoning, or your own inference — cite only facts with a concrete source. If no source is verified, add nothing rather than fabricate.',
+  'Do not put citations inside code blocks or tables. In this environment Markdown footnotes ([^1]) and inline HTML <details> render as plain text and are not clickable — never use them; use a Markdown link only.',
+].join(' ')
+
+const CITE_INSTRUCTIONS = {
+  superscript: CITE_SHARED + ' Format: a superscript numeral in a Markdown link, e.g. [¹](source). Superscript digits: ¹²³⁴⁵⁶⁷⁸⁹⁰; once you exceed nine distinct sources in one answer, fall back to plain [1](source), [2](source) for all.',
+  numeric: CITE_SHARED + ' Format: a plain numeral in a Markdown link, e.g. [1](source), [2](source).',
+  text: CITE_SHARED + ' Format: a short label in a Markdown link, e.g. [来源](source). Use a concise source label (site or file name), not a raw URL as the visible text.',
+}
 
 export const Config = z.object({
   // master switches — one per tool, so any tool can be disabled to avoid conflicts
@@ -34,10 +52,13 @@ export const Config = z.object({
   encodingOn: z.boolean().default(true).volatile(),
   tokenCostOn: z.boolean().default(true).volatile(),
   conflictsOn: z.boolean().default(true).volatile(),
+  // citation corner marks (system-prompt injection, off by default)
+  citeOn: z.boolean().default(false).volatile(),
+  citeFormat: z.union(['superscript', 'numeric', 'text']).default('superscript').volatile(),
 })
 
 // Services used by the host half.
-export const inject = ['tools']
+export const inject = ['tools', 'systemPrompt']
 
 export function apply(ctx, config) {
   // Volatile config fields are read live via .get(), so toggling a switch in
@@ -53,5 +74,22 @@ export function apply(ctx, config) {
     token_cost: () => enabled('tokenCostOn', true),
     config_conflicts: () => enabled('conflictsOn', true),
   }
-  return registerAllTools(ctx, isEnabled)
+  const disposeTools = registerAllTools(ctx, isEnabled)
+
+  // Read citation config live on every model step (volatile fields update in
+  // place), so no restart is needed after toggling the switch or format.
+  const citeText = () => {
+    if (!enabled('citeOn', false)) return ''
+    const raw = config && config.citeFormat && typeof config.citeFormat.get === 'function'
+      ? config.citeFormat.get() : 'superscript'
+    return CITE_INSTRUCTIONS[raw] || CITE_INSTRUCTIONS.superscript
+  }
+  const disposeCite = ctx.effect(() => ctx.systemPrompt.section({
+    name: 'toolbox:fact-citations',
+    order: 4400,
+    text: () => citeText(),
+    interpolate: false,
+  }), 'toolbox.citations.section()')
+
+  return () => { disposeCite?.(); disposeTools?.() }
 }

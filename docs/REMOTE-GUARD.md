@@ -43,7 +43,7 @@
 ### 任务 A：登录时启动
 
 - **名称**：`DSH Desktop Start`
-- **触发器**：At log on of specific user → `YangJiaJi`
+- **触发器**：At log on of specific user → `<你的用户名>`
 - **General**：选 **Run only when user is logged on**（不要选 "Run whether user is logged on or not"）；默认不勾 highest privileges。
 - **Action**：
   - Program/script：`D:\Deepseek\DeepSeek Harness.exe`

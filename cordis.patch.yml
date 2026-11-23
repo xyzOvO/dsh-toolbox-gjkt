@@ -18,3 +18,5 @@
         encodingOn: true
         tokenCostOn: true
         conflictsOn: true
+        citeOn: false
+        citeFormat: superscript

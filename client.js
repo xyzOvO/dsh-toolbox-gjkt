@@ -221,6 +221,7 @@ window.__ModuleLoader__.load({
     const LOCALE = 'toolbox.settings'
     const MODE_KEYS = ['background', 'always', 'never']
     const CHIME_KEYS = ['dual', 'single', 'triple', 'off']
+    const CITE_FORMAT_KEYS = ['superscript', 'numeric', 'text']
 
     const en = {
       nav: 'Toolbox',
@@ -293,6 +294,10 @@ window.__ModuleLoader__.load({
       remoteWatchdogOff: 'off — paused', remoteWatchdogHelp: 'Checks status every 20s; if offline and not already reconnecting, requests one reconnect (60s cooldown). The plugin itself already auto-reconnects; this is a safety net.',
       remoteAutoReconnected: 'auto-reconnect requested',
       remoteLimit: 'Cannot fix by plugin: expired token, revoked device, leftover credential lock, or a crashed DSH process.',
+      // citation corner marks
+      citeTitle: 'Citation corner marks', citeDesc: 'Instructs the model to append a clickable source mark after sourced facts. Off by default.',
+      citeFormat: 'mark format', citeFormat_superscript: 'Superscript [¹]', citeFormat_numeric: 'Number [1]', citeFormat_text: 'Label [source]',
+      citeHelp: 'Injected into the system prompt every step, stronger than a rules file. The model must actually retrieve a source to cite it; generic knowledge is not marked.',
     }
     const zh = {
       nav: '工具箱',
@@ -365,6 +370,10 @@ window.__ModuleLoader__.load({
       remoteWatchdogOff: '关 — 已暂停', remoteWatchdogHelp: '每 20 秒检查状态；若离线且未在重连，请求一次重连（60 秒冷却）。插件本身已带自动重连，这是一层保险。',
       remoteAutoReconnected: '已自动请求重连',
       remoteLimit: '插件修不了的：token 过期、设备被吊销、凭据锁残留、DSH 进程崩溃——这些只能手动处理。',
+      // citation corner marks
+      citeTitle: '引用角标', citeDesc: '让模型在有出处的事实后附一个可点来源角标。默认关闭。',
+      citeFormat: '角标格式', citeFormat_superscript: '上标 [¹]', citeFormat_numeric: '数字 [1]', citeFormat_text: '文字 [来源]',
+      citeHelp: '每步注入系统提示词，比规则文件更稳。模型必须真检索到出处才会标；通用常识不标。',
     }
 
     // factory-level translator for runtime notifications / toolbar (no React hook here)
@@ -427,7 +436,7 @@ window.__ModuleLoader__.load({
         { key: 'tokenCostOn', msg: 'run_token_cost', desc: 'desc_token_cost' },
         { key: 'conflictsOn', msg: 'run_config_conflicts', desc: 'desc_config_conflicts' },
       ]
-      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true })
+      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true })
       // remote health state — read only when the card is opened
       const [remote, setRemote] = useState({ loading: false, data: null, error: null, at: null })
       const [remoteHint, setRemoteHint] = useState('')
@@ -574,7 +583,8 @@ window.__ModuleLoader__.load({
           masterToggle('sysinfoOn', t('sysinfoOn')),
           masterToggle('encodingOn', t('encodingOn')),
           masterToggle('tokenCostOn', t('tokenCostOn')),
-          masterToggle('conflictsOn', t('conflictsOn'))
+          masterToggle('conflictsOn', t('conflictsOn')),
+          masterToggle('citeOn', t('citeTitle'))
         )),
         // ---- card 1: task notifications ----
         cardSection('notify', '🔔', t('notifyTitle'), h('div', null,
@@ -710,6 +720,17 @@ window.__ModuleLoader__.load({
               watchOn ? t('remoteWatchdogOn') : t('remoteWatchdogOff')))),
           h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', padding: '2px 0', lineHeight: '16px' } }, t('remoteWatchdogHelp')),
           h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 8, lineHeight: '16px' } }, t('remoteLimit'))
+        )),
+        // ---- card 5: citation corner marks ----
+        cardSection('cite', '🔖', t('citeTitle'), h('div', null,
+          !on('citeOn', false) ? h('div', { style: disabledHint }, '— ' + t('citeTitle') + ' OFF —') : null,
+          groupDesc(t('citeDesc')),
+          cardRow(t('citeFormat'), h('select', {
+            value: CITE_FORMAT_KEYS.indexOf(value.citeFormat) >= 0 ? value.citeFormat : 'superscript',
+            disabled: !writable || !on('citeOn', false),
+            onChange: (e) => setValue('citeFormat', e.target.value), style: controlStyle,
+          }, CITE_FORMAT_KEYS.map((k) => h('option', { key: k, value: k }, t('citeFormat_' + k)))), true),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 6, lineHeight: '16px' } }, t('citeHelp'))
         )),
       )
     }
