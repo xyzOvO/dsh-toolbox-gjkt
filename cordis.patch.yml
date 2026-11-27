@@ -8,6 +8,7 @@
         mode: background
         subagent: false
         chime: dual
+        notifyJump: true
         search: true
         translate: true
         copy: true

@@ -40,6 +40,7 @@ export const Config = z.object({
   mode: z.union(['background', 'always', 'never']).default('background').volatile(),
   subagent: z.boolean().default(false).volatile(),
   chime: z.union(['dual', 'single', 'triple', 'off']).default('dual').volatile(),
+  notifyJump: z.boolean().default(true).volatile(),
   // selection toolbar
   search: z.boolean().default(true).volatile(),
   translate: z.boolean().default(true).volatile(),

@@ -25,22 +25,103 @@ window.__ModuleLoader__.load({
     // Factory-level getter, wired in apply() to read the live volatile config so
     // chime changes apply immediately without a reload.
     let currentChime = () => 'dual'
+    // Click-to-jump: wired in apply() from ctx.uiWorkspace. Kept at factory scope
+    // so fireNotification can call it. liveNotifications keeps a strong ref so
+    // the browser does not GC the Notification and drop its click handler.
+    let jumpToSession = () => {}
+    let notifyJumpOn = () => true
+    const liveNotifications = new Set()
+
+    // =====================================================================
+    // push-to-talk voice input (drives the official voice-input bundle's
+    // microphone button through its localized aria-label — no host changes,
+    // no separate plugin, no package.json inject change)
+    // =====================================================================
+    const VOICE_START_LABELS = [
+      '开始录音', 'Start recording', '録音を開始', 'Empezar a grabar',
+      "Commencer l'enregistrement", 'Starten Sie die Aufnahme', 'Начать запись', 'Comece a gravar',
+    ]
+    const VOICE_STOP_LABELS = [
+      '停止并识别', 'Stop and transcribe', '停止して文字起こし', 'Detener y transcribir',
+      'Arrêtez et transcrivez', 'Stoppen Sie und transkribieren Sie', 'Остановись и перепиши', 'Pare e transcreva',
+    ]
+    const VOICE_PTT_KEY = 'dsh-toolbox.voicePtt'
+    let voicePttOn = () => false
+    function pttEnabled() { try { return localStorage.getItem(VOICE_PTT_KEY) === 'on' } catch (_) { return false } }
+    function setPttEnabled(v) { try { localStorage.setItem(VOICE_PTT_KEY, v ? 'on' : 'off') } catch (_) {} }
+    let pttRecording = false
+    let pttArmTimer = null
+    function voiceButton(labels) {
+      for (const label of labels) {
+        try {
+          const el = document.querySelector('button[aria-label="' + label + '"]')
+          if (el && !el.disabled) return el
+        } catch (_) {}
+      }
+      return null
+    }
+    function voicePttStart() {
+      if (pttRecording) return
+      const btn = voiceButton(VOICE_START_LABELS)
+      if (btn) { pttRecording = true; try { btn.click() } catch (_) {} }
+    }
+    function voicePttStop(attempt) {
+      if (pttArmTimer) { clearTimeout(pttArmTimer); pttArmTimer = null }
+      if (!pttRecording) return
+      const btn = voiceButton(VOICE_STOP_LABELS)
+      if (btn) {
+        pttRecording = false
+        try { btn.click() } catch (_) {}
+        return
+      }
+      // official UI may still be in 'requesting' (mic permission / warm-up)
+      // and hasn't rendered the stop button yet — retry a few times.
+      const n = attempt || 0
+      if (n < 8) setTimeout(() => voicePttStop(n + 1), 150)
+      else pttRecording = false
+    }
+    function onVoiceKeyDown(e) {
+      if (!voicePttOn()) return
+      if (!e || e.key !== 'Alt' || e.ctrlKey || e.metaKey || e.shiftKey) return
+      if (pttRecording || pttArmTimer) return
+      try { e.preventDefault() } catch (_) {}
+      // arm after a short delay: a quick Alt tap or Alt+Tab must not start recording
+      pttArmTimer = setTimeout(() => { pttArmTimer = null; voicePttStart() }, 180)
+    }
+    function onVoiceKeyUp(e) {
+      if (!voicePttOn()) return
+      if (!e || e.key !== 'Alt') return
+      voicePttStop()
+    }
+    function onVoiceBlur() { voicePttStop() }
+
     function unlockAudio() {
       if (audioCtx) return
       const AC = window.AudioContext || window.webkitAudioContext
       if (!AC) return
       try { audioCtx = new AC() } catch (_) { audioCtx = null }
     }
-    function playChime() {
+    function playChime(kind) {
       const mode = currentChime()
       if (mode === 'off' || !audioCtx) return
       try {
         if (audioCtx.state === 'suspended') audioCtx.resume()
         const now = audioCtx.currentTime
-        // each preset: [frequency, start offset (s), duration (s)]
-        const notes = mode === 'single' ? [[880, 0, 0.3]]
-          : mode === 'triple' ? [[784, 0, 0.22], [988, 0.16, 0.22], [1318.5, 0.32, 0.32]]
-          : [[880, 0, 0.3], [1174.66, 0.16, 0.3]] // dual (default)
+        // Event-specific presets take priority over the user's chosen completion chime.
+        // Each note: [frequency, start offset (s), duration (s)].
+        let notes
+        if (kind === 'error') {
+          notes = [[440, 0, 0.22], [330, 0.14, 0.34]]      // low descending — warning
+        } else if (kind === 'artifact') {
+          notes = [[1046.5, 0, 0.14], [1318.5, 0.1, 0.14], [1568, 0.2, 0.24]] // crisp upward sparkle
+        } else if (kind === 'workflow') {
+          notes = [[784, 0, 0.2], [988, 0.15, 0.2], [1318.5, 0.3, 0.3]]       // steady triple
+        } else {
+          // completion / test: follow the user's chosen preset
+          notes = mode === 'single' ? [[880, 0, 0.3]]
+            : mode === 'triple' ? [[784, 0, 0.22], [988, 0.16, 0.22], [1318.5, 0.32, 0.32]]
+            : [[880, 0, 0.3], [1174.66, 0.16, 0.3]] // dual (default)
+        }
         notes.forEach(([freq, offset, dur]) => {
           const osc = audioCtx.createOscillator()
           const gain = audioCtx.createGain()
@@ -48,7 +129,7 @@ window.__ModuleLoader__.load({
           osc.frequency.value = freq
           const t = now + offset
           gain.gain.setValueAtTime(0.0001, t)
-          gain.gain.exponentialRampToValueAtTime(0.18, t + 0.02)
+          gain.gain.exponentialRampToValueAtTime(0.45, t + 0.02) // louder: 0.18 -> 0.45
           gain.gain.exponentialRampToValueAtTime(0.0001, t + dur)
           osc.connect(gain).connect(audioCtx.destination)
           osc.start(t)
@@ -60,12 +141,21 @@ window.__ModuleLoader__.load({
       if (typeof document === 'undefined') return true
       try { return document.hidden === true || document.hasFocus() === false } catch (_) { return true }
     }
-    function fireNotification(title, body) {
-      playChime()
+    function fireNotification(title, body, sessionId, kind) {
+      playChime(kind)
       if (typeof window.Notification === 'undefined') return 'no-Notification-API'
       if (window.Notification.permission !== 'granted') return 'perm=' + window.Notification.permission
       try {
         const n = new window.Notification(title, { body })
+        liveNotifications.add(n) // keep alive so the click handler survives GC
+        if (sessionId && notifyJumpOn()) {
+          n.onclick = () => {
+            try { jumpToSession(sessionId) } catch (_) {}
+            try { window.focus() } catch (_) {} // best effort; cannot un-minimize
+            try { n.close() } catch (_) {}
+          }
+        }
+        n.onclose = () => { liveNotifications.delete(n); n.onclick = null }
         setTimeout(() => { try { n.close() } catch (_) {} }, 12000)
         return 'sent'
       } catch (e) {
@@ -96,14 +186,14 @@ window.__ModuleLoader__.load({
       if (!id) return
       if (summary.origin === 'subagent' || summary.parentId || summary.parentSessionId) subagentIds.add(id)
     }
-    function autoNotify(sessionId, title, body, settings) {
+    function autoNotify(sessionId, title, body, settings, kind) {
       const mode = settings && settings.mode ? settings.mode : 'background'
       const subagentOn = !!(settings && settings.subagent)
       if (mode === 'never') return 'disabled'
       if (subagentIds.has(sessionId) && !subagentOn) return 'subagent-off'
-      if (mode === 'always') return fireNotification(title, body)
+      if (mode === 'always') return fireNotification(title, body, sessionId, kind)
       if (!isBackgrounded()) return 'foreground'
-      return fireNotification(title, body)
+      return fireNotification(title, body, sessionId, kind)
     }
 
     // =====================================================================
@@ -239,6 +329,10 @@ window.__ModuleLoader__.load({
       chime: 'Notification sound', chime_dual: 'Classic (two notes)',
       chime_single: 'Single chime', chime_triple: 'Three notes', chime_off: 'Off (silent)',
       subagent: 'Also notify when a subagent finishes',
+      notifyJump: 'Click notification to open that session',
+      notifyJumpHelp: 'Works while the DSH window is open or in the background. A minimized window cannot be restored by a web notification.',
+      voicePtt: 'Push-to-talk voice input (hold Alt)',
+      voicePttHelp: 'Hold Alt to start recording through the official voice input, release to transcribe into the draft. Requires the official voice bundle enabled. Bad transcript? Press Ctrl+Z once to undo the whole insertion. Windows may show the menu bar on a lone Alt — tell me if it does.',
       autoWake: 'Auto-continue after completion',
       testWake: 'Test auto-continue', wakeSent: 'Sent — watch this session continue on its own',
       autoWakeDesc: 'When a task produces an artifact or ends a workflow, append a message to continue it. Appears as a user bubble; needs this window open.',
@@ -315,6 +409,10 @@ window.__ModuleLoader__.load({
       chime: '通知提示音', chime_dual: '经典双音',
       chime_single: '单音', chime_triple: '三连音', chime_off: '关闭（静音）',
       subagent: '子代理完成也通知',
+      notifyJump: '点通知跳到对应会话',
+      notifyJumpHelp: '窗口开着或在后台时有效；窗口最小化时，网页通知无法把它拉回来。',
+      voicePtt: '长按 Alt 语音输入（按住说话）',
+      voicePttHelp: '长按 Alt 借用官方语音输入开始录音，松开自动转写并插入草稿。需先启用官方语音输入 bundle。输错了按一次 Ctrl+Z 就能整段撤回这段语音文字。Windows 上单独按 Alt 可能弹出菜单栏，如有此现象告诉我换键。',
       autoWake: '完成后自动续作',
       testWake: '测试自动续作', wakeSent: '已发送——看本会话自己接着跑',
       autoWakeDesc: '任务产出文件或工作流结束时，自动追加一条消息让它继续。会显示一条用户气泡，且需要本窗口保持打开。',
@@ -436,7 +534,9 @@ window.__ModuleLoader__.load({
         { key: 'tokenCostOn', msg: 'run_token_cost', desc: 'desc_token_cost' },
         { key: 'conflictsOn', msg: 'run_config_conflicts', desc: 'desc_config_conflicts' },
       ]
-      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true })
+      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true, voice: true })
+      const [pttOn, setPttOn] = useState(pttEnabled())
+      const togglePtt = (v) => { setPttEnabled(v); setPttOn(v) }
       // remote health state — read only when the card is opened
       const [remote, setRemote] = useState({ loading: false, data: null, error: null, at: null })
       const [remoteHint, setRemoteHint] = useState('')
@@ -604,6 +704,13 @@ window.__ModuleLoader__.load({
             onChange: (v) => setSubagent(v), label: t('subagent'),
           })),
           cardRow(
+            h('span', null, t('notifyJump'), h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', marginTop: 3 } }, t('notifyJumpHelp'))),
+            h(Switch, {
+              checked: on('notifyJump', true), disabled: !writable || !on('notifyOn', true),
+              onChange: (v) => setValue('notifyJump', v), label: t('notifyJump'),
+            })
+          ),
+          cardRow(
             h('span', null, t('autoWake'), h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', marginTop: 3 } }, t('autoWakeDesc'))),
             h(Switch, {
               checked: on('autoWakeOn', false), disabled: !writable || !on('notifyOn', true),
@@ -732,6 +839,13 @@ window.__ModuleLoader__.load({
           }, CITE_FORMAT_KEYS.map((k) => h('option', { key: k, value: k }, t('citeFormat_' + k)))), true),
           h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 6, lineHeight: '16px' } }, t('citeHelp'))
         )),
+        // ---- card 6: push-to-talk voice input ----
+        cardSection('voice', '🎤', t('voicePtt'), h('div', null,
+          groupDesc(t('voicePttHelp')),
+          cardRow(t('voicePtt'), h(Switch, {
+            checked: pttOn, onChange: togglePtt, label: t('voicePtt'),
+          }), true)
+        )),
       )
     }
 
@@ -821,7 +935,7 @@ window.__ModuleLoader__.load({
     // apply
     // =====================================================================
     return {
-      inject: ['slots', 'locale', 'configForms', 'uiConversation', 'remote', 'remote.session', 'sessions'],
+      inject: ['slots', 'locale', 'configForms', 'uiConversation', 'remote', 'remote.session', 'sessions', 'uiWorkspace'],
       apply(ctx) {
         const form = ctx.configForms.get(ENTRY_ID)
         ctx.effect(() => ctx.locale.register(LOCALE, { en, zh }))
@@ -829,6 +943,17 @@ window.__ModuleLoader__.load({
         tr = t // bind the factory-level translator used by notifications / toolbar
         const cfg = () => (form.getSnapshot() && form.getSnapshot().value) || {}
         currentChime = () => (CHIME_KEYS.indexOf(cfg().chime) >= 0 ? cfg().chime : 'dual')
+        notifyJumpOn = () => cfg().notifyJump !== false
+        voicePttOn = () => pttEnabled()
+        try {
+          window.addEventListener('keydown', onVoiceKeyDown, true)
+          window.addEventListener('keyup', onVoiceKeyUp, true)
+          window.addEventListener('blur', onVoiceBlur)
+        } catch (_) {}
+        jumpToSession = (sessionId) => {
+          const uw = ctx.get('uiWorkspace') || (ctx.uiWorkspace)
+          if (uw && typeof uw.openSession === 'function') uw.openSession(sessionId)
+        }
         const isOn = (key, dflt) => (typeof cfg()[key] === 'boolean' ? cfg()[key] : dflt)
 
         // settings section contribution
@@ -984,7 +1109,9 @@ window.__ModuleLoader__.load({
               }
             }
             const s = settings()
-            if (s.notifyOn !== false) autoNotify(id, tv('taskDone'), lines.join('\n'), s)
+            // pick the heaviest event for the chime: artifact > workflow > plain completion
+            const doneKind = st && st.artifacts.size ? 'artifact' : (st && st.workflows.size ? 'workflow' : 'done')
+            if (s.notifyOn !== false) autoNotify(id, tv('taskDone'), lines.join('\n'), s, doneKind)
 
             // auto-continue: only on completion with real artifacts/workflow, only when backgrounded
             if (s.autoWakeOn === true && st && (st.artifacts.size || st.workflows.size) && isBackgrounded()) {
@@ -1034,7 +1161,7 @@ window.__ModuleLoader__.load({
             const s = settings()
             if (s.notifyOn === false) return
             const detail = typeof message === 'string' && message ? tv('errorSuffix') + message.slice(0, 120) : ''
-            autoNotify(sessionId, tv('taskError'), titleOf(sessionId, ctx) + detail, s)
+            autoNotify(sessionId, tv('taskError'), titleOf(sessionId, ctx) + detail, s, 'error')
           })
           const offRemoved = remote.$on('api-session/removed', (sessionId) => {
             subagentIds.delete(sessionId)
@@ -1076,7 +1203,13 @@ window.__ModuleLoader__.load({
           }
         }, 'dsh-toolbox-gjkt.events')
 
-        return () => {}
+        return () => {
+          try {
+            window.removeEventListener('keydown', onVoiceKeyDown, true)
+            window.removeEventListener('keyup', onVoiceKeyUp, true)
+            window.removeEventListener('blur', onVoiceBlur)
+          } catch (_) {}
+        }
       },
     }
   },
