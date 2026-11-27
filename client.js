@@ -95,6 +95,73 @@ window.__ModuleLoader__.load({
     }
     function onVoiceBlur() { voicePttStop() }
 
+    // =====================================================================
+    // "agent is waiting" notification.
+    // While a question / approval / plan-review card is open, DSH keeps the
+    // session `running`, so the normal running→idle notification never fires.
+    // We watch the official cards appear (by their data-* markers) and pop a
+    // system notification when the window is in the background. Pure client
+    // change, toggle stored in localStorage — no reinstall.
+    // =====================================================================
+    const AWAIT_KEY = 'dsh-toolbox.awaitNotify'
+    let awaitNotifyOn = () => true
+    function getAwaitNotifyOn() { try { return localStorage.getItem(AWAIT_KEY) !== 'off' } catch (_) { return true } }
+    function setAwaitNotifyOn(v) { try { localStorage.setItem(AWAIT_KEY, v ? 'on' : 'off') } catch (_) {} }
+    const awaitNotifiedKeys = new Set()
+    let awaitSessionId = () => null
+    let awaitObserver = null
+    const AWAIT_MARKERS = [
+      ['data-approval-key', 'awaitApproval'],
+      ['data-question-key', 'awaitQuestion'],
+      ['data-plan-review-key', 'awaitPlan'],
+    ]
+    let awaitPollTimer = null
+    function scanAwaitCards() {
+      if (!awaitNotifyOn()) return
+      for (const [attr, titleKey] of AWAIT_MARKERS) {
+        let els = []
+        try { els = Array.from(document.querySelectorAll('[' + attr + ']')) } catch (_) {}
+        for (const el of els) {
+          let key = ''
+          try { key = el.getAttribute(attr) || '' } catch (_) {}
+          const dedupe = attr + ':' + key
+          if (awaitNotifiedKeys.has(dedupe)) continue
+          awaitNotifiedKeys.add(dedupe)
+          if (awaitNotifiedKeys.size > 50) {
+            const first = awaitNotifiedKeys.values().next().value
+            awaitNotifiedKeys.delete(first)
+          }
+          fireNotification(tv(titleKey), tv('awaitNotifyBody'), awaitSessionId(), 'await')
+        }
+      }
+    }
+    function watchAwait() {
+      if (awaitObserver) return
+      try {
+        awaitObserver = new MutationObserver((_records) => { try { scanAwaitCards() } catch (_) {} })
+        const root = document.body || document.documentElement
+        if (root) {
+          awaitObserver.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['data-approval-key', 'data-question-key', 'data-plan-review-key'],
+          })
+        } else awaitObserver = null
+      } catch (_) { awaitObserver = null }
+      // No background gate: notify whenever a question / approval / plan review
+      // is waiting, window focused or not. Poll as a fallback so a card rendered
+      // before the observer attaches is still caught.
+      try { scanAwaitCards() } catch (_) {}
+      if (!awaitPollTimer) awaitPollTimer = setInterval(() => { try { scanAwaitCards() } catch (_) {} }, 1500)
+    }
+    function stopAwaitWatch() {
+      try { if (awaitObserver) awaitObserver.disconnect() } catch (_) {}
+      awaitObserver = null
+      try { if (awaitPollTimer) clearInterval(awaitPollTimer) } catch (_) {}
+      awaitPollTimer = null
+    }
+
     function unlockAudio() {
       if (audioCtx) return
       const AC = window.AudioContext || window.webkitAudioContext
@@ -116,6 +183,8 @@ window.__ModuleLoader__.load({
           notes = [[1046.5, 0, 0.14], [1318.5, 0.1, 0.14], [1568, 0.2, 0.24]] // crisp upward sparkle
         } else if (kind === 'workflow') {
           notes = [[784, 0, 0.2], [988, 0.15, 0.2], [1318.5, 0.3, 0.3]]       // steady triple
+        } else if (kind === 'await') {
+          notes = [[659.25, 0, 0.18], [830.61, 0.16, 0.26]]                   // soft two-note "attention"
         } else {
           // completion / test: follow the user's chosen preset
           notes = mode === 'single' ? [[880, 0, 0.3]]
@@ -331,6 +400,12 @@ window.__ModuleLoader__.load({
       subagent: 'Also notify when a subagent finishes',
       notifyJump: 'Click notification to open that session',
       notifyJumpHelp: 'Works while the DSH window is open or in the background. A minimized window cannot be restored by a web notification.',
+      awaitNotify: 'Notify when the agent waits for my input',
+      awaitNotifyHelp: 'When a question, approval or plan review pops up, send a system notification — even if the window is focused. Depends on the official UI markup.',
+      awaitApproval: 'Agent awaits your approval',
+      awaitQuestion: 'Agent asked you a question',
+      awaitPlan: 'Agent awaits your plan review',
+      awaitNotifyBody: 'The agent is waiting for your input. Click to open that session.',
       voicePtt: 'Push-to-talk voice input (hold Alt)',
       voicePttHelp: 'Hold Alt to start recording through the official voice input, release to transcribe into the draft. Requires the official voice bundle enabled. Bad transcript? Press Ctrl+Z once to undo the whole insertion. Windows may show the menu bar on a lone Alt — tell me if it does.',
       autoWake: 'Auto-continue after completion',
@@ -411,6 +486,12 @@ window.__ModuleLoader__.load({
       subagent: '子代理完成也通知',
       notifyJump: '点通知跳到对应会话',
       notifyJumpHelp: '窗口开着或在后台时有效；窗口最小化时，网页通知无法把它拉回来。',
+      awaitNotify: 'Agent 等我输入时提醒我',
+      awaitNotifyHelp: '当弹出提问、授权确认或计划审阅时发一条系统通知——即使窗口在前台也会提醒，避免最小化时漏报。依赖官方界面的标记，官方改动后可能失效。',
+      awaitApproval: 'Agent 等你授权确认',
+      awaitQuestion: 'Agent 向你提了个问题',
+      awaitPlan: 'Agent 等你审阅计划',
+      awaitNotifyBody: 'Agent 正在等你输入，点通知打开对应会话。',
       voicePtt: '长按 Alt 语音输入（按住说话）',
       voicePttHelp: '长按 Alt 借用官方语音输入开始录音，松开自动转写并插入草稿。需先启用官方语音输入 bundle。输错了按一次 Ctrl+Z 就能整段撤回这段语音文字。Windows 上单独按 Alt 可能弹出菜单栏，如有此现象告诉我换键。',
       autoWake: '完成后自动续作',
@@ -537,6 +618,8 @@ window.__ModuleLoader__.load({
       const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true, voice: true })
       const [pttOn, setPttOn] = useState(pttEnabled())
       const togglePtt = (v) => { setPttEnabled(v); setPttOn(v) }
+      const [awaitOn, setAwaitOn] = useState(getAwaitNotifyOn())
+      const toggleAwait = (v) => { setAwaitNotifyOn(v); setAwaitOn(v) }
       // remote health state — read only when the card is opened
       const [remote, setRemote] = useState({ loading: false, data: null, error: null, at: null })
       const [remoteHint, setRemoteHint] = useState('')
@@ -715,6 +798,13 @@ window.__ModuleLoader__.load({
             h(Switch, {
               checked: on('autoWakeOn', false), disabled: !writable || !on('notifyOn', true),
               onChange: (v) => setValue('autoWakeOn', v), label: t('autoWake'),
+            })
+          ),
+          cardRow(
+            h('span', null, t('awaitNotify'), h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', marginTop: 3 } }, t('awaitNotifyHelp'))),
+            h(Switch, {
+              checked: awaitOn, disabled: !on('notifyOn', true),
+              onChange: toggleAwait, label: t('awaitNotify'),
             })
           ),
           h('div', { style: { display: 'flex', alignItems: 'center', paddingTop: 10, gap: 10 } },
@@ -945,6 +1035,16 @@ window.__ModuleLoader__.load({
         currentChime = () => (CHIME_KEYS.indexOf(cfg().chime) >= 0 ? cfg().chime : 'dual')
         notifyJumpOn = () => cfg().notifyJump !== false
         voicePttOn = () => pttEnabled()
+        awaitNotifyOn = () => getAwaitNotifyOn()
+        // best-effort: tag the notification with the currently focused session
+        awaitSessionId = () => {
+          try {
+            const byId = ctx.get('sessions').list.getSnapshot().byId
+            for (const id of Object.keys(byId)) if (byId[id] && byId[id].retainedBy && byId[id].retainedBy.mainView > 0) return id
+          } catch (_) {}
+          return null
+        }
+        watchAwait()
         try {
           window.addEventListener('keydown', onVoiceKeyDown, true)
           window.addEventListener('keyup', onVoiceKeyUp, true)
@@ -1209,6 +1309,7 @@ window.__ModuleLoader__.load({
             window.removeEventListener('keyup', onVoiceKeyUp, true)
             window.removeEventListener('blur', onVoiceBlur)
           } catch (_) {}
+          stopAwaitWatch()
         }
       },
     }
