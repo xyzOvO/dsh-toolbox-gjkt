@@ -33,6 +33,102 @@ window.__ModuleLoader__.load({
     const liveNotifications = new Set()
 
     // =====================================================================
+    // Ctrl+click a generated / referenced file to open it in the OS default
+    // application. Hook the native click in the capture phase; when Ctrl is
+    // held on a DSH file card or inline file link, stop the event and call
+    // DSH's own Remote API to open the path externally. Pure client change;
+    // toggle stored in localStorage — no reinstall.
+    // =====================================================================
+    const CTRL_OPEN_KEY = 'dsh-toolbox.ctrlOpen'
+    let ctrlOpenOn = () => true
+    function getCtrlOpenOn() { try { return localStorage.getItem(CTRL_OPEN_KEY) === 'on' } catch (_) { return false } }
+    function setCtrlOpenOn(v) { try { localStorage.setItem(CTRL_OPEN_KEY, v ? 'on' : 'off') } catch (_) {} }
+    let sessionOpenPath = async () => false
+    let workspaceStat = async () => null
+    let sessionCwdOf = () => null
+
+    function isAbsolutePath(p) {
+      return typeof p === 'string' && /^(?:[a-zA-Z]:[\\/]|\/)/.test(p)
+    }
+    function joinCwd(cwd, p) {
+      if (!cwd || typeof cwd !== 'string') return null
+      const rel = String(p).replace(/^(?:\.?[\\/])+/, '')
+      const sep = /[\\/]$/.test(cwd) ? '' : (cwd.indexOf('\\') >= 0 ? '\\' : '/')
+      return cwd.replace(/[\\/]+$/, '') + sep + rel
+    }
+
+    function pathTitle(el) {
+      if (!el || el.nodeType !== 1 || typeof el.getAttribute !== 'function') return null
+      const v = el.getAttribute('title')
+      if (!v) return null
+      // A title on a file card / file mention is a resolved path; accept
+      // Windows drive, POSIX root, ./.. relative, or something ending in an
+      // extension. Don't over-filter: a wrong accept only costs one no-op open.
+      if (/^(?:[a-zA-Z]:[\\/]|\/|\.{0,2}[\\/])/.test(v) || /\.[A-Za-z0-9]{1,8}$/.test(v)) return v
+      return null
+    }
+    function fileTitleFromEvent(e) {
+      // composedPath() pierces shadow DOM (event.target alone does not).
+      let path = []
+      try { path = typeof e.composedPath === 'function' ? e.composedPath() : [] } catch (_) {}
+      if (!path.length) { let n = e.target; while (n) { path.push(n); n = n.parentNode } }
+      // 1) presented-file card / review file: stable marker holds the path
+      for (const el of path) {
+        if (!el || el.nodeType !== 1 || typeof el.getAttribute !== 'function') continue
+        let rf = null
+        try { rf = el.getAttribute('data-review-file') } catch (_) {}
+        if (rf) return rf
+        let isCard = false
+        try { isCard = el.hasAttribute('data-presented-file') } catch (_) {}
+        if (isCard) {
+          try {
+            const btn = el.querySelector('button[title], a[title]')
+            const t = pathTitle(btn)
+            if (t) return t
+          } catch (_) {}
+        }
+      }
+      // 2) inline Markdown file link / code mention — a BUTTON/A with a path title
+      for (const el of path) {
+        if (!el || el.nodeType !== 1) continue
+        const tag = (el.tagName || '').toUpperCase()
+        if (tag !== 'BUTTON' && tag !== 'A') continue
+        const t = pathTitle(el)
+        if (t) return t
+      }
+      return null
+    }
+
+    async function onFileClickCapture(e) {
+      if (!ctrlOpenOn()) return
+      if (!e.ctrlKey || e.button !== 0) return
+      const title = fileTitleFromEvent(e)
+      if (!title) return
+      // Stop DSH's own "open in sidebar preview" handler as early as possible.
+      try {
+        e.preventDefault()
+        e.stopPropagation()
+        if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation()
+      } catch (_) {}
+      // Resolve to an ABSOLUTE Host path before handing it to the opener.
+      // A relative path would be resolved by the Host against its own process
+      // cwd, and explorer.exe on a path that does not exist silently falls back
+      // to opening the user's Documents folder — which looks like "it opened
+      // Explorer instead of the file".
+      let path = title
+      if (!isAbsolutePath(path)) {
+        const sid = awaitSessionId()
+        let resolved = null
+        try { resolved = await workspaceStat(sid, path) } catch (_) {}
+        if (!resolved) resolved = joinCwd(sessionCwdOf(sid), path)
+        if (!resolved) return
+        path = resolved
+      }
+      if (!isAbsolutePath(path)) return
+      try { await sessionOpenPath({ path }) } catch (_) {}
+    }
+
+    // =====================================================================
     // push-to-talk voice input (drives the official voice-input bundle's
     // microphone button through its localized aria-label — no host changes,
     // no separate plugin, no package.json inject change)
@@ -63,11 +159,13 @@ window.__ModuleLoader__.load({
     function voicePttStart() {
       if (pttRecording) return
       const btn = voiceButton(VOICE_START_LABELS)
-      if (btn) { pttRecording = true; try { btn.click() } catch (_) {} }
+      if (btn) { pttRecording = true; silenceSince = 0; silenceSamples = []; try { btn.click() } catch (_) {} }
     }
     function voicePttStop(attempt) {
       if (pttArmTimer) { clearTimeout(pttArmTimer); pttArmTimer = null }
       if (!pttRecording) return
+      silenceSince = 0
+      silenceSamples = []
       const btn = voiceButton(VOICE_STOP_LABELS)
       if (btn) {
         pttRecording = false
@@ -94,6 +192,114 @@ window.__ModuleLoader__.load({
       voicePttStop()
     }
     function onVoiceBlur() { voicePttStop() }
+
+    // ---- silence auto-stop: cut recording after N seconds with no speech ----
+    const VOICE_SILENCE_KEY = 'dsh-toolbox.voiceSilence'
+    const SILENCE_MS = 10000
+    let voiceSilenceOn = () => true
+    function silenceEnabled() { try { return localStorage.getItem(VOICE_SILENCE_KEY) === 'on' } catch (_) { return false } }
+    function setSilenceEnabled(v) { try { localStorage.setItem(VOICE_SILENCE_KEY, v ? 'on' : 'off') } catch (_) {} }
+    // One-time migration: these shortcut toggles used to be ON by default.
+    // An existing install that never touched them has no stored key, so flipping
+    // the default to OFF would silently disable them for that user. Detect any
+    // prior toolbox key as "existing user" and pin the two that were formerly
+    // default-on to 'on', preserving their previous behaviour. New installs
+    // (no keys at all) keep the new OFF default.
+    function migrateShortcutDefaults() {
+      const MIG = 'dsh-toolbox.shortcutMigrated'
+      try {
+        if (localStorage.getItem(MIG) === 'done') return
+        let old = false
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i)
+            if (k && k.indexOf('dsh-toolbox.') === 0 && k !== MIG) { old = true; break }
+          }
+        } catch (_) {
+          old = ['dsh-toolbox.voicePtt', 'dsh-toolbox.remoteWatchdog',
+            'dsh-toolbox.awaitNotify', VOICE_SILENCE_KEY, CTRL_OPEN_KEY]
+            .some(k => { try { return localStorage.getItem(k) !== null } catch (_) { return false } })
+        }
+        if (old) {
+          if (localStorage.getItem(CTRL_OPEN_KEY) === null) localStorage.setItem(CTRL_OPEN_KEY, 'on')
+          if (localStorage.getItem(VOICE_SILENCE_KEY) === null) localStorage.setItem(VOICE_SILENCE_KEY, 'on')
+        }
+        localStorage.setItem(MIG, 'done')
+      } catch (_) {}
+    }
+    migrateShortcutDefaults()
+    let silenceSince = 0
+    let silenceTimer = null
+    // Rolling window of recent waveform heights, used as an adaptive noise
+    // floor. The minimum over the window is "silence" for THIS mic/environment;
+    // speech is a level clearly above it. A fixed threshold fails because even
+    // quiet room noise easily pushes the waveform past a hard-coded height.
+    let silenceSamples = []
+    // Live mic level straight from the official waveform: the newest <line>
+    // bars' y1/y2 encode amplitude (baseline height 1, speech pushes it up).
+    function voiceSilenceLevel() {
+      try {
+        const row = document.querySelector('[data-voice-activity="recording"]')
+        if (!row) return null
+        // The capture row also contains the cancel/stop buttons, whose icons
+        // are <svg> too — a plain row.querySelector('svg') grabs the cancel
+        // icon (no <line> children). Pick the svg that actually has <line>
+        // bars (the waveform), instead of relying on viewBox attribute casing.
+        let lines = null
+        const svgs = row.querySelectorAll('svg')
+        for (let i = 0; i < svgs.length; i++) {
+          const cand = svgs[i].querySelectorAll('line')
+          if (cand && cand.length) { lines = cand; break }
+        }
+        if (!lines || !lines.length) return null
+        let max = 0
+        const start = Math.max(0, lines.length - 6)
+        for (let i = start; i < lines.length; i++) {
+          const y1 = parseFloat((lines[i].getAttribute('y1') || '20'))
+          const y2 = parseFloat((lines[i].getAttribute('y2') || '20'))
+          const h = Math.abs(y2 - y1) / 2
+          if (h > max) max = h
+        }
+        return max
+      } catch (_) { return null }
+    }
+    // Stop by clicking the official button, independent of how recording was
+    // started (long-press Alt OR the official mic button). voicePttStop() has
+    // a `!pttRecording` guard, so it cannot be reused for mic-button recordings.
+    function voiceSilenceStop() {
+      const btn = voiceButton(VOICE_STOP_LABELS)
+      if (!btn) return false
+      pttRecording = false
+      silenceSince = 0
+      try { btn.click() } catch (_) {}
+      return true
+    }
+    function checkVoiceSilence() {
+      if (!voiceSilenceOn()) { silenceSince = 0; silenceSamples = []; return }
+      // level === null means the official row is not in 'recording' phase —
+      // covers both "not recording" and the requesting/warm-up stage.
+      const level = voiceSilenceLevel()
+      if (level === null) { silenceSince = 0; silenceSamples = []; return }
+      // Adaptive noise floor: keep the last ~40 samples (12s at 300ms), take
+      // the minimum as this environment's silence baseline. Speech must rise
+      // clearly above the floor (by >4 waveform units) to reset the timer.
+      silenceSamples.push(level)
+      if (silenceSamples.length > 40) silenceSamples.shift()
+      const floor = Math.min.apply(null, silenceSamples)
+      if (level > floor + 4) { silenceSince = Date.now(); return } // someone is speaking
+      if (!silenceSince) { silenceSince = Date.now(); return }
+      if (Date.now() - silenceSince >= SILENCE_MS) {
+        silenceSince = 0
+        silenceSamples = []
+        try { voiceSilenceStop() } catch (_) {}
+      }
+    }
+    function startSilenceWatch() {
+      try { if (!silenceTimer) silenceTimer = setInterval(checkVoiceSilence, 300) } catch (_) {}
+    }
+    function stopSilenceWatch() {
+      try { if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null } } catch (_) {}
+    }
 
     // =====================================================================
     // "agent is waiting" notification.
@@ -406,8 +612,15 @@ window.__ModuleLoader__.load({
       awaitQuestion: 'Agent asked you a question',
       awaitPlan: 'Agent awaits your plan review',
       awaitNotifyBody: 'The agent is waiting for your input. Click to open that session.',
+      keysTitle: 'Shortcuts (all off by default)',
+      keysDesc: 'Every shortcut here is OFF by default — turn on only the ones you want. Existing users keep their previous settings.',
       voicePtt: 'Push-to-talk voice input (hold Alt)',
       voicePttHelp: 'Hold Alt to start recording through the official voice input, release to transcribe into the draft. Requires the official voice bundle enabled. Bad transcript? Press Ctrl+Z once to undo the whole insertion. Windows may show the menu bar on a lone Alt — tell me if it does.',
+      voiceSilence: 'Auto-stop after 10s of silence',
+      voiceSilenceHelp: 'While recording, if you stop speaking for 10 seconds, the recording is stopped and transcribed automatically. Reads the official waveform; turns off harmlessly if that markup changes.',
+      ctrlOpenTitle: 'Ctrl+click to open file externally',
+      ctrlOpen: 'Ctrl+click file → open in system app',
+      ctrlOpenHelp: 'Hold Ctrl and click a generated file card or an inline file link to open it with the OS default application instead of the sidebar preview. Stored locally.',
       autoWake: 'Auto-continue after completion',
       testWake: 'Test auto-continue', wakeSent: 'Sent — watch this session continue on its own',
       autoWakeDesc: 'When a task produces an artifact or ends a workflow, append a message to continue it. Appears as a user bubble; needs this window open.',
@@ -492,8 +705,15 @@ window.__ModuleLoader__.load({
       awaitQuestion: 'Agent 向你提了个问题',
       awaitPlan: 'Agent 等你审阅计划',
       awaitNotifyBody: 'Agent 正在等你输入，点通知打开对应会话。',
+      keysTitle: '快捷操作（默认全部关闭）',
+      keysDesc: '这里每个快捷键默认都是关的——按需手动开启即可。老用户原有的开启状态会保留，不受影响。',
       voicePtt: '长按 Alt 语音输入（按住说话）',
       voicePttHelp: '长按 Alt 借用官方语音输入开始录音，松开自动转写并插入草稿。需先启用官方语音输入 bundle。输错了按一次 Ctrl+Z 就能整段撤回这段语音文字。Windows 上单独按 Alt 可能弹出菜单栏，如有此现象告诉我换键。',
+      voiceSilence: '静音 10 秒自动掐断',
+      voiceSilenceHelp: '录音时若连续 10 秒没说话，自动停止并转写。靠读官方波形实现，官方改了波形结构后会失效（只是不再自动掐断，无害）。',
+      ctrlOpenTitle: 'Ctrl+点击用外部软件打开文件',
+      ctrlOpen: 'Ctrl+点击文件 → 用系统默认应用打开',
+      ctrlOpenHelp: '按住 Ctrl 点击生成的文件卡片或正文里的文件链接，用系统默认应用打开，而不是在右侧栏预览。开关存在本地。',
       autoWake: '完成后自动续作',
       testWake: '测试自动续作', wakeSent: '已发送——看本会话自己接着跑',
       autoWakeDesc: '任务产出文件或工作流结束时，自动追加一条消息让它继续。会显示一条用户气泡，且需要本窗口保持打开。',
@@ -615,9 +835,13 @@ window.__ModuleLoader__.load({
         { key: 'tokenCostOn', msg: 'run_token_cost', desc: 'desc_token_cost' },
         { key: 'conflictsOn', msg: 'run_config_conflicts', desc: 'desc_config_conflicts' },
       ]
-      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true, voice: true })
+      const [collapsed, setCollapsed] = useState({ master: true, notify: true, toolbar: true, tools: true, remote: true, cite: true, keys: true })
+      const [ctrlOn, setCtrlOn] = useState(getCtrlOpenOn())
+      const toggleCtrl = (v) => { setCtrlOpenOn(v); setCtrlOn(v) }
       const [pttOn, setPttOn] = useState(pttEnabled())
       const togglePtt = (v) => { setPttEnabled(v); setPttOn(v) }
+      const [silenceOn, setSilenceOn] = useState(silenceEnabled())
+      const toggleSilence = (v) => { setSilenceEnabled(v); setSilenceOn(v) }
       const [awaitOn, setAwaitOn] = useState(getAwaitNotifyOn())
       const toggleAwait = (v) => { setAwaitNotifyOn(v); setAwaitOn(v) }
       // remote health state — read only when the card is opened
@@ -929,12 +1153,22 @@ window.__ModuleLoader__.load({
           }, CITE_FORMAT_KEYS.map((k) => h('option', { key: k, value: k }, t('citeFormat_' + k)))), true),
           h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 6, lineHeight: '16px' } }, t('citeHelp'))
         )),
-        // ---- card 6: push-to-talk voice input ----
-        cardSection('voice', '🎤', t('voicePtt'), h('div', null,
-          groupDesc(t('voicePttHelp')),
+        // ---- card 6: shortcuts (all default OFF) ----
+        cardSection('keys', '⌨️', t('keysTitle'), h('div', null,
+          groupDesc(t('keysDesc')),
           cardRow(t('voicePtt'), h(Switch, {
             checked: pttOn, onChange: togglePtt, label: t('voicePtt'),
-          }), true)
+          }), true),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingBottom: 8, lineHeight: '16px' } }, t('voicePttHelp')),
+          cardRow(t('voiceSilence'), h(Switch, {
+            checked: silenceOn, onChange: toggleSilence, label: t('voiceSilence'),
+            disabled: !pttOn,
+          })),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingBottom: 8, lineHeight: '16px' } }, t('voiceSilenceHelp')),
+          cardRow(t('ctrlOpen'), h(Switch, {
+            checked: ctrlOn, onChange: toggleCtrl, label: t('ctrlOpen'),
+          })),
+          h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #888)', paddingTop: 6, lineHeight: '16px' } }, t('ctrlOpenHelp'))
         )),
       )
     }
@@ -1036,6 +1270,35 @@ window.__ModuleLoader__.load({
         notifyJumpOn = () => cfg().notifyJump !== false
         voicePttOn = () => pttEnabled()
         awaitNotifyOn = () => getAwaitNotifyOn()
+        ctrlOpenOn = () => getCtrlOpenOn()
+        // Ctrl+click external-open — use DSH's own Remote APIs, same as its
+        // "open in application" context menu. Resolve with try/catch because
+        // workspaceFiles/session namespaces may mount slightly later.
+        sessionOpenPath = async (req) => {
+          const sess = ctx.get('remote.session') || ctx.remote?.session
+          if (!sess || typeof sess.openWorkspacePath !== 'function') return false
+          try {
+            const res = await sess.openWorkspacePath(req)
+            return !!(res && (res.ok === undefined || res.ok === true))
+          } catch (_) { return false }
+        }
+        workspaceStat = async (sid, path) => {
+          let wf = null
+          try { wf = ctx.get('remote.workspaceFiles') } catch (_) {}
+          if (!wf) { try { wf = ctx.remote?.workspaceFiles } catch (_) {} }
+          if (!wf || typeof wf.stat !== 'function' || !sid) return null
+          try {
+            const r = await wf.stat(sid, path)
+            // Host stat returns { absolutePath }, not { path }.
+            return (r && (r.absolutePath || r.path || r.hostPath)) || null
+          } catch (_) { return null }
+        }
+        sessionCwdOf = (sid) => {
+          try {
+            const row = ctx.get('sessions').list.getSnapshot().byId[sid]
+            return row && typeof row.cwd === 'string' && row.cwd !== '' ? row.cwd : null
+          } catch (_) { return null }
+        }
         // best-effort: tag the notification with the currently focused session
         awaitSessionId = () => {
           try {
@@ -1045,10 +1308,13 @@ window.__ModuleLoader__.load({
           return null
         }
         watchAwait()
+        voiceSilenceOn = () => silenceEnabled()
+        startSilenceWatch()
         try {
           window.addEventListener('keydown', onVoiceKeyDown, true)
           window.addEventListener('keyup', onVoiceKeyUp, true)
           window.addEventListener('blur', onVoiceBlur)
+          window.addEventListener('click', onFileClickCapture, true)
         } catch (_) {}
         jumpToSession = (sessionId) => {
           const uw = ctx.get('uiWorkspace') || (ctx.uiWorkspace)
@@ -1308,8 +1574,10 @@ window.__ModuleLoader__.load({
             window.removeEventListener('keydown', onVoiceKeyDown, true)
             window.removeEventListener('keyup', onVoiceKeyUp, true)
             window.removeEventListener('blur', onVoiceBlur)
+            window.removeEventListener('click', onFileClickCapture, true)
           } catch (_) {}
           stopAwaitWatch()
+          stopSilenceWatch()
         }
       },
     }

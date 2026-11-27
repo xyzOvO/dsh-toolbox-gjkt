@@ -1,4 +1,4 @@
-# 工具箱（v0.0.12）
+# 工具箱（v0.0.16）
 
 一个 bundle 放七个小工具，设置统一在左下角 **设置 → 工具箱**（与「通用 / 模型 / 账号」同级的独立栏）。主对话框不放任何控件。
 
@@ -126,19 +126,25 @@ DSH 后台任务完成 / 出错时，弹 **系统级通知**（窗口最小化�
 - **边界**：插件只保证"指令每次都在"，不保证模型 100% 照做；来源真实性取决于模型是否真检索。关闭时 section 返回空串，系统提示词不受影响。
 - 旧的 `~/.dsh/cite-rules.md` 仅作存档保留，`~/.dsh/AGENTS.md` 里的指针已撤销（避免重复指令、省 token）。
 
-## 🎤 长按 Alt 语音输入（push-to-talk，默认关）
+## ⌨️ 快捷操作（全部默认关）
 
 把官方语音输入 bundle 的麦克风按钮接到一个按住说话的快捷键上，不另做录音实现：
 
 - **用法**：先在设置页打开本开关 → 确保官方 `@deepseek-ai/dsh-experimental-voice-input-bundle` 已启用并完成模型准备 → **按住 Alt** 开始录音，**松开 Alt** 自动点「停止并识别」，转写文字插入草稿（不自动发送）。
 - **实现**：原生 `keydown`/`keyup` 监听，按住 180ms 后才开始（避免 Alt+Tab / 轻点误触），窗口失焦自动停止。通过本地化 `aria-label` 找官方按钮并 `.click()`，中/英/日/西四种界面文案都匹配。
 - **输错了怎么办**：转写文字是一次性插入草稿的，**按一次 Ctrl+Z 就整段撤回**，不用手动删。（输入框底层是 Lexical，一段语音 = 一条撤销记录。）
+- **静音 10 秒自动掐断**：全新安装默认关（老用户此前开着的保留）。录音时工具箱每 300ms 读一次官方波形 SVG 的 `<line>` 高度判断音量，连续 10 秒静音就自动点"停止并识别"转写，不用一直按着 Alt。靠官方波形 DOM 结构，官方改了结构后只是不再自动掐断（无害）。持续背景噪声可能让它一直判定"有人在说"而不掐断。开关在 ⌨️ 卡里，存 localStorage（键 `dsh-toolbox.voiceSilence`）。
 - **边界**：官方按钮没有稳定 `data-*` 钩子，只靠 aria-label，官方 UI 改标签会失灵；Windows 上单独按 Alt 可能激活窗口菜单栏（如出现请反馈换键）；窗口失焦会取消录音；语音识别全靠官方 bundle（本机 SenseVoice，约 239MB 模型、CPU 本地跑，不出网）。
-- **开关持久化**：走 localStorage（键 `dsh-toolbox.voicePtt`），不为它单独改 Config 触发重装。
+- **Ctrl+点击文件用外部软件打开**：全新安装默认关（老用户此前开着的保留）。设置页 ⌨️ 卡一个开关（键 `dsh-toolbox.ctrlOpen`）。按住 Ctrl 点击**生成的文件卡片**（deliverables/present）或**正文里的文件链接**（Markdown 路径），工具箱在捕获阶段拦下这次点击，改用 DSH 自己的 `session.openWorkspacePath({path})` 走系统默认应用打开，而不是右侧栏预览。文档卡片有稳定标记 `data-presented-file`，正文链接靠按钮的 `title` 路径识别——官方若改这两处 DOM，功能会失效（只是 Ctrl+点击退回预览，无害）。
+
+  **路径必须先解析成绝对路径**：Host 的 `workspaceFiles.stat()` 返回字段是 `absolutePath`（不是 `path`）；拿不到就退用会话 `cwd` 拼接；两次都失败就放弃这次外开。原因是 `openWorkspacePath` 会让 Host 用 `resolve()` 解相对路径（相对的是 Host 进程 cwd，不是工作区），而 `explorer.exe` 收到一个不存在或不可解析的目标时会静默退回打开「文档」文件夹——表现就是"Ctrl+点击打开的是资源管理器文档"。普通点击（不按 Ctrl）完全不受影响。
+
+- **开关持久化**：走 localStorage（键 `dsh-toolbox.voicePtt`、`dsh-toolbox.voiceSilence`、`dsh-toolbox.ctrlOpen`），不为它们单独改 Config 触发重装。
+- **默认关 + 老用户保留**：这三个快捷操作对全新安装默认关闭。一次性迁移逻辑：若本地已存过任意 `dsh-toolbox.*` 标记（老用户），会把此前默认开的 Ctrl+点击外开、静音掐断补记为 `on`，保留原有行为；全新安装（无任何标记）维持默认关。迁移只跑一次（键 `dsh-toolbox.shortcutMigrated`）。
 
 ## 设置存储
 
-绝大部分开关走 DSH 原生 Config（host `index.js` 的 `export const Config`，字段全部 `.volatile()`，改完即时生效、无需重启插件）。设置页通过 `settings.section` 挂载，读写走 `ctx.configForms`。host 工具的 master 开关在**执行时**判断，所以关掉后立即生效，不必重装。两个例外走 localStorage 持久化（避免为它们单独改 Config 触发重装）：远程看门狗开关、长按 Alt 语音输入开关。没有把控件塞进主对话框。
+绝大部分开关走 DSH 原生 Config（host `index.js` 的 `export const Config`，字段全部 `.volatile()`，改完即时生效、无需重启插件）。设置页通过 `settings.section` 挂载，读写走 `ctx.configForms`。host 工具的 master 开关在**执行时**判断，所以关掉后立即生效，不必重装。几个例外走 localStorage 持久化（避免为它们单独改 Config 触发重装）：远程看门狗、长按 Alt 语音、静音自动掐断、Agent 等待提醒、Ctrl+点击外部打开。没有把控件塞进主对话框。
 
 ## 回滚
 
@@ -146,4 +152,4 @@ DSH 后台任务完成 / 出错时，弹 **系统级通知**（窗口最小化�
 
 ## 版本
 
-当前 **0.0.12** — 含总开关 / 任务通知（含点通知跳会话、按事件分音、Agent 等待输入提醒）/ 划词工具栏 / 自动续作 / 四个 host agent 工具 / 远程巡检 / 引用角标 / 长按 Alt 语音输入（push-to-talk）。版本约定：推送 GitHub 前统一保持 0.0.1；首次推送记为 0.0.2，此后每次变动 +0.0.1。旧包配置不迁移（都是默认值，影响小）。
+当前 **0.0.16** — 含总开关 / 任务通知（含点通知跳会话、按事件分音、Agent 等待输入提醒）/ 划词工具栏 / 自动续作 / 四个 host agent 工具 / 远程巡检 / 引用角标 / 长按 Alt 语音输入（push-to-talk，含静音 10 秒自动掐断）/ Ctrl+点击文件用外部软件打开。版本约定：推送 GitHub 前统一保持 0.0.1；首次推送记为 0.0.2，此后每次变动 +0.0.1。旧包配置不迁移（都是默认值，影响小）。
